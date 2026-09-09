@@ -98,6 +98,42 @@ fn trusted_git_metadata_roots(workspace: &Path) -> BTreeSet<PathBuf> {
     roots
 }
 
+fn insert_validated_worktree_roots(roots: &mut BTreeSet<PathBuf>, dot_git: &Path, git_dir: &Path) {
+    let Ok(dot_git) = dot_git.canonicalize() else {
+        return;
+    };
+    let Ok(backpointer) = std::fs::read_to_string(git_dir.join("gitdir")) else {
+        return;
+    };
+    let backpointer = git_dir.join(backpointer.trim());
+    if backpointer.canonicalize().ok().as_deref() != Some(dot_git.as_path()) {
+        return;
+    }
+    let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) else {
+        return;
+    };
+    let Ok(common) = git_dir.join(common.trim()).canonicalize() else {
+        return;
+    };
+    let Some(workspace_parent) = dot_git.parent().and_then(Path::parent) else {
+        return;
+    };
+    if common.file_name().and_then(|name| name.to_str()) != Some(".git") {
+        return;
+    }
+    if !std::fs::metadata(&common).is_ok_and(|metadata| metadata.is_dir()) {
+        return;
+    }
+    if common.parent().and_then(Path::parent) != Some(workspace_parent) {
+        return;
+    }
+    if !git_dir.starts_with(common.join("worktrees")) {
+        return;
+    }
+    roots.insert(git_dir.to_path_buf());
+    roots.insert(common);
+}
+
 /// Whether `path` (already canonical) sits at or beneath one of `roots`.
 fn within_trusted_root(path: &Path, roots: &BTreeSet<PathBuf>) -> bool {
     roots.iter().any(|root| path.starts_with(root))
@@ -147,7 +183,7 @@ fn workspace_git_paths(workspace: &Path) -> BTreeSet<PathBuf> {
         return paths;
     }
 
-    let roots = trusted_git_metadata_roots(workspace);
+    let mut roots = trusted_git_metadata_roots(workspace);
 
     let git_dir = if metadata.is_file() {
         // "gitdir: <path>", possibly relative to the workspace.
@@ -176,6 +212,9 @@ fn workspace_git_paths(workspace: &Path) -> BTreeSet<PathBuf> {
     // The git directory itself must resolve inside a trusted root; if it does
     // not, the checkout is pointing somewhere it has no business pointing and
     // nothing further is trusted either.
+    if !within_trusted_root(&git_dir, &roots) {
+        insert_validated_worktree_roots(&mut roots, &dot_git, &git_dir);
+    }
     if !within_trusted_root(&git_dir, &roots) {
         return paths;
     }
@@ -527,6 +566,48 @@ mod tests {
     }
 
     #[test]
+    fn workspace_git_paths_accepts_a_sibling_linked_worktree() {
+        if !Command::new("git")
+            .arg("--version")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+
+        let tree = TempTree::new();
+        let main = tree.path().join("main");
+        let worktree = tree.path().join("linked");
+        std::fs::create_dir_all(&main).expect("create main repo");
+
+        run_git(&main, &["init"]);
+        std::fs::write(main.join("file"), b"content").expect("write file");
+        run_git(&main, &["add", "file"]);
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        run_git(&main, &["worktree", "add", "../linked"]);
+
+        let common = main.join(".git").canonicalize().expect("canonical common");
+        let resolved = workspace_git_paths(&worktree);
+        assert!(resolved.contains(&common));
+        assert!(
+            resolved
+                .iter()
+                .any(|path| path.starts_with(common.join("worktrees")))
+        );
+    }
+
+    #[test]
     fn workspace_git_paths_rejects_a_gitdir_pointing_at_an_external_canary() {
         // The workspace names a directory that no ancestor .git/.repo covers.
         // It must be excluded so the sandbox never binds it writable.
@@ -550,6 +631,31 @@ mod tests {
     }
 
     #[test]
+    fn workspace_git_paths_rejects_a_fake_worktree_canary() {
+        let tree = TempTree::new();
+        let canary = tree.path().join("canary/.git");
+        let fake_worktree = canary.join("worktrees/x");
+        std::fs::create_dir_all(&canary).expect("create canary");
+        std::fs::create_dir_all(&fake_worktree).expect("create fake worktree");
+
+        let workspace = tree.path().join("super/work");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::write(
+            workspace.join(".git"),
+            format!("gitdir: {}\n", fake_worktree.display()),
+        )
+        .expect("write .git file");
+        std::fs::write(
+            fake_worktree.join("gitdir"),
+            workspace.join(".git").to_string_lossy().as_bytes(),
+        )
+        .expect("write fake backpointer");
+        std::fs::write(fake_worktree.join("commondir"), "../..\n").expect("write fake commondir");
+
+        assert!(workspace_git_paths(&workspace).is_empty());
+    }
+
+    #[test]
     fn workspace_git_paths_rejects_a_symlinked_gitdir_escaping_trusted_roots() {
         let tree = TempTree::new();
         let canary = tree.path().join("canary");
@@ -560,5 +666,15 @@ mod tests {
         std::os::unix::fs::symlink(&canary, workspace.join(".git")).expect("symlink .git");
 
         assert!(workspace_git_paths(&workspace).is_empty());
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed with {status}");
     }
 }
