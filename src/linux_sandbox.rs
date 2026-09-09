@@ -84,16 +84,36 @@ fn runtime_read_paths() -> BTreeSet<PathBuf> {
 ///
 /// A non-executable file named `bwrap` earlier in PATH must not shadow a real
 /// one later, so the execute bit is checked rather than just the file type.
-fn bubblewrap_executable() -> Option<PathBuf> {
+fn bubblewrap_executable_in_paths(
+    paths: impl IntoIterator<Item = PathBuf>,
+    workspace: &Path,
+) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    let workspace = workspace.canonicalize().ok();
+    paths
+        .into_iter()
         .map(|dir| dir.join("bwrap"))
-        .find(|candidate| {
-            std::fs::metadata(candidate)
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .find_map(|candidate| {
+            let metadata = std::fs::metadata(&candidate).ok()?;
+            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+                return None;
+            }
+            let canonical = candidate.canonicalize().ok()?;
+            if workspace
+                .as_ref()
+                .is_some_and(|root| canonical.starts_with(root))
+            {
+                None
+            } else {
+                Some(canonical)
+            }
         })
+}
+
+fn bubblewrap_executable(workspace: &Path) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    bubblewrap_executable_in_paths(std::env::split_paths(&path), workspace)
 }
 
 /// Build a bubblewrap invocation that confines `command` to `workspace` plus its
@@ -104,17 +124,17 @@ fn bubblewrap_executable() -> Option<PathBuf> {
 /// rather than merely denied. `--dev /dev` supplies a minimal set of device
 /// nodes (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/tty` and the like),
 /// `--tmpfs /tmp` keeps the host's `/tmp` out of reach, and `--unshare-pid`
-/// hides host processes.
-///
-/// `--new-session` is deliberately omitted: it detaches the controlling
-/// terminal, which would make `/dev/tty` unusable.
+/// hides host processes. `--new-session` gives the sandboxed command its
+/// own session.
 fn bubblewrap_command(
     bwrap: &Path,
     command: &str,
     workspace: &Path,
+    cwd: &Path,
     scratch: &Path,
 ) -> io::Result<Command> {
     let workspace = canonical_existing(workspace)?;
+    let cwd = canonical_existing(cwd)?;
     let scratch = canonical_existing(scratch)?;
 
     let mut bwrap_command = Command::new(bwrap);
@@ -123,6 +143,7 @@ fn bubblewrap_command(
         .arg("--unshare-pid")
         .arg("--unshare-ipc")
         .arg("--unshare-uts")
+        .arg("--new-session")
         .arg("--die-with-parent")
         .arg("--proc")
         .arg("/proc")
@@ -153,7 +174,7 @@ fn bubblewrap_command(
 
     bwrap_command
         .arg("--chdir")
-        .arg(&workspace)
+        .arg(&cwd)
         .arg("--setenv")
         .arg("TMPDIR")
         .arg(&scratch)
@@ -178,7 +199,11 @@ fn bubblewrap_command(
 /// error says so, since the caller cannot run anything unconfined.
 ///
 /// The scratch directory is removed again if the command could not be prepared.
-pub fn helper_command(command: &str, workspace: &Path) -> io::Result<(Command, PathBuf)> {
+pub fn helper_command(
+    command: &str,
+    workspace: &Path,
+    cwd: &Path,
+) -> io::Result<(Command, PathBuf)> {
     let scratch_dir =
         std::env::temp_dir().join(format!("catdesk-sandbox-{}", uuid::Uuid::new_v4()));
     let mut dir_builder = std::fs::DirBuilder::new();
@@ -195,11 +220,11 @@ pub fn helper_command(command: &str, workspace: &Path) -> io::Result<(Command, P
             )
         })?;
 
-    let prepared = match bubblewrap_executable() {
-        Some(bwrap) => bubblewrap_command(&bwrap, command, workspace, &scratch_dir),
+    let prepared = match bubblewrap_executable(workspace) {
+        Some(bwrap) => bubblewrap_command(&bwrap, command, workspace, cwd, &scratch_dir),
         None => Err(io::Error::other(
-            "no usable sandbox: bwrap was not found on PATH. Install bubblewrap to run \
-             commands confined.",
+            "no usable sandbox: bwrap was not found on PATH outside the workspace. Install \
+             bubblewrap to run commands confined.",
         )),
     };
 
@@ -215,6 +240,7 @@ pub fn helper_command(command: &str, workspace: &Path) -> io::Result<(Command, P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn runtime_read_paths_include_resolv_conf_target() {
@@ -252,12 +278,12 @@ mod tests {
         // bwrap may not be installed in every environment. helper_command
         // reports that rather than returning a command, so there is nothing to
         // assert about the scratch directory here.
-        if bubblewrap_executable().is_none() {
+        if bubblewrap_executable(Path::new(".")).is_none() {
             return;
         }
 
-        let (_command, scratch) =
-            helper_command("true", Path::new(".")).expect("prepare sandbox helper command");
+        let (_command, scratch) = helper_command("true", Path::new("."), Path::new("."))
+            .expect("prepare sandbox helper command");
         let mode = std::fs::metadata(&scratch)
             .expect("scratch metadata")
             .permissions()
@@ -265,5 +291,84 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o700);
         std::fs::remove_dir_all(scratch).expect("remove scratch directory");
+    }
+
+    #[test]
+    fn bubblewrap_command_chdirs_to_cwd_and_uses_new_session() {
+        let tree = TempTree::new();
+        let workspace = tree.path().join("workspace");
+        let cwd = workspace.join("src");
+        let scratch = tree.path().join("scratch");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&scratch).expect("create scratch");
+
+        let command = bubblewrap_command(
+            Path::new("/usr/bin/bwrap"),
+            "pwd",
+            &workspace,
+            &cwd,
+            &scratch,
+        )
+        .expect("build bubblewrap command");
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
+
+        assert!(args.iter().any(|arg| arg.as_os_str() == "--new-session"));
+        let chdir = args
+            .windows(2)
+            .find(|pair| pair[0].as_os_str() == OsStr::new("--chdir"))
+            .map(|pair| PathBuf::from(pair[1].clone()))
+            .expect("--chdir argument");
+        assert_eq!(chdir, cwd.canonicalize().expect("canonical cwd"));
+    }
+
+    #[test]
+    fn bubblewrap_executable_skips_workspace_symlink_and_uses_later_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tree = TempTree::new();
+        let workspace = tree.path().join("workspace");
+        let workspace_bin = workspace.join("bin");
+        std::fs::create_dir_all(&workspace_bin).expect("create workspace bin");
+        let hijacked = workspace_bin.join("bwrap");
+        std::fs::write(&hijacked, b"#!/bin/sh\n").expect("write workspace bwrap");
+        std::fs::set_permissions(&hijacked, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod workspace bwrap");
+
+        let symlink_bin = tree.path().join("symlink-bin");
+        std::fs::create_dir_all(&symlink_bin).expect("create symlink bin");
+        std::os::unix::fs::symlink(&hijacked, symlink_bin.join("bwrap")).expect("symlink bwrap");
+
+        let real_bin = tree.path().join("real-bin");
+        std::fs::create_dir_all(&real_bin).expect("create real bin");
+        let real = real_bin.join("bwrap");
+        std::fs::write(&real, b"#!/bin/sh\n").expect("write real bwrap");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod real bwrap");
+
+        assert_eq!(
+            bubblewrap_executable_in_paths(vec![symlink_bin, real_bin], &workspace),
+            Some(real.canonicalize().expect("canonical real bwrap"))
+        );
+    }
+
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("catdesk-sandbox-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("create temp tree");
+            Self(dir.canonicalize().expect("canonical temp tree"))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
