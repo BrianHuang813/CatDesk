@@ -670,6 +670,14 @@ mod tests {
 
     #[test]
     fn workspace_git_paths_accepts_submodule_name_that_differs_from_path() {
+        if !Command::new("git")
+            .arg("--version")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+
         // super/                <- ancestor holding the real .git
         //   .git/modules/libfoo/
         //   vendor/foo/.git     <- file: "gitdir: ../../.git/modules/libfoo"
@@ -978,7 +986,15 @@ mod tests {
         .expect("write backpointer");
         std::os::unix::fs::symlink(&canary, tree.path().join("main/common.git"))
             .expect("symlink common");
-        std::fs::write(git_dir.join("commondir"), "../../common.git\n").expect("write commondir");
+        std::fs::write(git_dir.join("commondir"), "../../../common.git\n")
+            .expect("write commondir");
+        assert_eq!(
+            git_dir
+                .join("../../../common.git")
+                .canonicalize()
+                .expect("canonical commondir target"),
+            canary.canonicalize().expect("canonical canary")
+        );
 
         assert!(workspace_git_paths(&workspace).is_empty());
     }
